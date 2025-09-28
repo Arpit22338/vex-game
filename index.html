@@ -1,0 +1,467 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Vex-ish Polished</title>
+<style>
+  :root{
+    --fg:#e9f1ff; --dim:#a8b4c9; --accent:#6ee7ff; --danger:#ff7070; --ok:#65f38b; --warn:#ffe966;
+  }
+  html,body{margin:0;height:100%;background:#0b0f1a;color:var(--fg);font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+  canvas{display:block; width:100vw; height:100vh; touch-action:none}
+  #hud{
+    position:fixed; left:12px; top:12px; z-index:10; 
+    background:rgba(10,14,24,.45); backdrop-filter: blur(6px);
+    border:1px solid rgba(255,255,255,.08);
+    box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    border-radius:12px; padding:10px 12px; font-size:14px
+  }
+  #hud b{color:#fff}
+  #tips{position:fixed; right:12px; top:12px; opacity:.75; font-size:13px}
+  #mobile{
+    position:fixed; left:0; right:0; bottom:22px; display:flex; gap:14px; justify-content:center; z-index:11; pointer-events:none;
+  }
+  .btn{
+    pointer-events:auto; user-select:none;
+    width:68px;height:68px;border-radius:18px;border:1px solid rgba(255,255,255,.08);
+    background:radial-gradient(120px 120px at 35% 30%, rgba(255,255,255,.13), rgba(255,255,255,.03));
+    box-shadow: inset 0 3px 8px rgba(255,255,255,.06), 0 12px 28px rgba(0,0,0,.35);
+    display:grid;place-items:center;font-weight:700; color:#dfe9ff;
+  }
+  .btn:active{transform:scale(.98)}
+  #overlay{
+    position:fixed; inset:0; display:none; place-items:center; z-index:12;
+    background:linear-gradient(180deg, rgba(5,8,14,.7), rgba(5,8,14,.85));
+    text-align:center; padding:30px;
+  }
+  #overlay.show{display:grid}
+  #overlay .card{
+    background:rgba(14,18,30,.7); border:1px solid rgba(255,255,255,.08);
+    border-radius:16px; padding:22px 26px; max-width:520px
+  }
+  #overlay h1{margin:0 0 8px 0; font-size:28px}
+  #overlay p{margin:6px 0 0 0; color:var(--dim)}
+</style>
+</head>
+<body>
+  <div id="hud">⏱️ <b id="t">0.00</b>s • 💀 <b id="d">0</b> • <span id="lvl">L1</span> • <span id="state"></span></div>
+  <div id="tips">Move: A/D or ←/→ • Jump: W/↑/Space • <b>P</b>=Pause • <b>R</b>=Restart</div>
+  <div id="mobile">
+    <div class="btn" id="left">←</div>
+    <div class="btn" id="jump">⭡</div>
+    <div class="btn" id="right">→</div>
+  </div>
+  <div id="overlay"><div class="card">
+    <h1 id="ov-title">Paused</h1>
+    <p id="ov-sub">Press P to resume</p>
+  </div></div>
+  <canvas id="c"></canvas>
+
+<script>
+(() => {
+  // ---------- Canvas + DPR scaling ----------
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  let DPR = Math.min(2.5, (window.devicePixelRatio||1));
+  const VW = 960, VH = 540; // virtual design size
+  function resize(){
+    DPR = Math.min(2.5, (window.devicePixelRatio||1));
+    const w = Math.floor(window.innerWidth * DPR);
+    const h = Math.floor(window.innerHeight * DPR);
+    cv.width = w; cv.height = h;
+  }
+  addEventListener('resize', resize); resize();
+
+  // ---------- HUD ----------
+  const HUDt = document.getElementById('t');
+  const HUDd = document.getElementById('d');
+  const HUDlvl = document.getElementById('lvl');
+  const HUDstate = document.getElementById('state');
+  const overlay = document.getElementById('overlay');
+  const ovTitle = document.getElementById('ov-title');
+  const ovSub = document.getElementById('ov-sub');
+
+  // ---------- Helpers ----------
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp=(a,b,t)=>a+(b-a)*t;
+  const AABB=(a,b)=> (a.x < b.x + b.w) && (a.x + a.w > b.x) && (a.y < b.y + b.h) && (a.y + a.h > b.y);
+  const nowMs = ()=>performance.now();
+
+  // Sample points along rect bottom edge for spike test (robust & fast)
+  function rectHitsSpike(r, s){
+    // quick reject (AABB)
+    if(!(r.x < s.x + s.w && r.x + r.w > s.x && r.y < s.y + s.h && r.y + r.h > s.y)) return false;
+    // triangle points (upward)
+    const ax=s.x, ay=s.y+s.h, bx=s.x+s.w/2, by=s.y, cx=s.x+s.w, cy=s.y+s.h;
+    // check 5 points along bottom of rect
+    for(let i=0;i<=4;i++){
+      const px = r.x + (r.w/4)*i;
+      const py = r.y + r.h - 1;
+      // barycentric sign test
+      const s1 = (ax-cx)*(py-cy)-(ay-cy)*(px-cx);
+      const s2 = (bx-ax)*(py-ay)-(by-ay)*(px-ax);
+      const s3 = (cx-bx)*(py-by)-(cy-by)*(px-bx);
+      const neg = (s1<0)||(s2<0)||(s3<0), pos=(s1>0)||(s2>0)||(s3>0);
+      if(!(neg && pos)) return true;
+    }
+    return false;
+  }
+
+  // ---------- Level data ----------
+  // types: plat, mplat, spike, flag, spawn, checkpoint, deco (parallax)
+  const levels = [
+    {
+      deco: [
+        {type:'deco', layer:0, x:0, y:0, w:4000, h:1000}, // sky gradient area
+      ],
+      items: [
+        {type:'spawn', x:40, y:420},
+        {type:'plat',  x:-200, y:500, w:2000, h:44},
+        {type:'plat',  x:130, y:440, w:130, h:14},
+        {type:'spike', x:360, y:486, w:32, h:14},
+        {type:'spike', x:392, y:486, w:32, h:14},
+        {type:'plat',  x:290, y:415, w:80, h:14},
+        {type:'mplat', x:470, y:410, w:120, h:14, ax:470, bx:820, speed:1.35},
+        {type:'plat',  x:860, y:360, w:140, h:14},
+        {type:'checkpoint', x:900, y:330, w:20, h:34},
+        {type:'spike', x:600, y:486, w:32, h:14},
+        {type:'spike', x:632, y:486, w:32, h:14},
+        {type:'plat',  x:1000, y:300, w:80, h:14},
+        {type:'flag',  x:1040, y:260, w:22, h:44},
+      ]
+    },
+    {
+      deco: [{type:'deco', layer:0, x:0, y:0, w:4000, h:1000}],
+      items: [
+        {type:'spawn', x:40, y:420},
+        {type:'plat',  x:-200, y:500, w:2200, h:44},
+        {type:'plat',  x:120, y:440, w:120, h:14},
+        {type:'mplat', x:280, y:420, w:90, h:14, ay:420, by:320, speed:1.2},
+        {type:'spike', x:430, y:486, w:32, h:14},
+        {type:'spike', x:462, y:486, w:32, h:14},
+        {type:'mplat', x:540, y:380, w:120, h:14, ax:540, bx:900, speed:1.7},
+        {type:'plat',  x:920, y:340, w:70, h:14},
+        {type:'flag',  x:942, y:300, w:22, h:44},
+      ]
+    }
+  ];
+
+  // ---------- Game state ----------
+  let levelIndex = 0, world=[], deco=[];
+  let player, spawn, checkpoint=null;
+  let keys = new Set();
+  let deaths = 0, levelStart = nowMs(), finished=false, paused=false;
+  let cam = {x:0, y:0}; // camera in world space
+  let shakeT=0, shakeMag=0;
+
+  // input helpers for mobile
+  const mobile = {left:false, right:false, jump:false};
+  const btnL = document.getElementById('left');
+  const btnR = document.getElementById('right');
+  const btnJ = document.getElementById('jump');
+  function mobileBind(btn, prop){
+    const on = (e)=>{ e.preventDefault(); mobile[prop]=true; };
+    const off= (e)=>{ e.preventDefault(); mobile[prop]=false; };
+    ['pointerdown','touchstart','mousedown'].forEach(ev=>btn.addEventListener(ev,on));
+    ['pointerup','pointercancel','touchend','touchcancel','mouseup','mouseleave'].forEach(ev=>btn.addEventListener(ev,off));
+  }
+  mobileBind(btnL,'left'); mobileBind(btnR,'right'); mobileBind(btnJ,'jump');
+
+  function loadLevel(i){
+    levelIndex = i;
+    const L = levels[i];
+    // deep-ish clone
+    world = L.items.map(o=>({...o}));
+    deco  = (L.deco||[]).map(o=>({...o}));
+    spawn = world.find(o=>o.type==='spawn') || {x:20,y:20};
+    checkpoint = null;
+    player = {x:spawn.x, y:spawn.y, w:16, h:28, vx:0, vy:0, onGround:false, facing:1, anim:0};
+    levelStart = nowMs(); finished=false; cam.x = player.x - VW/2; cam.y = player.y - VH/2;
+    HUDlvl.textContent = `L${i+1}`;
+    HUDstate.textContent = '';
+  }
+  loadLevel(0);
+
+  // ---------- Input ----------
+  addEventListener('keydown', e=>{
+    if(['ArrowLeft','ArrowRight','ArrowUp','Space','KeyA','KeyD','KeyW','KeyR','KeyP'].includes(e.code)) e.preventDefault();
+    keys.add(e.code);
+    if(e.code==='KeyR'){ deaths++; shake(180,6); respawn(); }
+    if(e.code==='KeyP'){ paused=!paused; toggleOverlay(paused ? 'Paused' : '', paused ? 'Press P to resume' : ''); }
+  });
+  addEventListener('keyup', e=>keys.delete(e.code));
+
+  function toggleOverlay(title, sub){
+    if(title){ overlay.classList.add('show'); ovTitle.textContent=title; ovSub.textContent=sub; }
+    else overlay.classList.remove('show');
+  }
+
+  function respawn(){
+    const s = checkpoint || spawn;
+    player.x = s.x; player.y = s.y; player.vx=0; player.vy=0; player.onGround=false;
+  }
+
+  function shake(ms, mag){ shakeT = nowMs()+ms; shakeMag = mag; }
+
+  // ---------- Physics ----------
+  const g = 0.6, jumpV = -10.4, moveAcc = 0.75, maxSpd = 4.6, fric = 0.82;
+  // feel helpers
+  const COYOTE_MS = 90, JUMPBUF_MS = 110;
+  let lastGroundMs = 0, lastJumpPressMs = -9999;
+
+  function pressJump(){
+    lastJumpPressMs = nowMs();
+  }
+
+  function update(dt){
+    if(finished || paused) return;
+
+    // move platforms
+    for(const o of world){
+      if(o.type==='mplat'){
+        if(o.ax!=null && o.bx!=null){
+          if(o.dir==null) o.dir=1;
+          o.x += o.speed*o.dir;
+          if(o.x<=o.ax){ o.x=o.ax; o.dir=1; }
+          if(o.x+o.w>=o.bx){ o.x=o.bx-o.w; o.dir=-1; }
+        }
+        if(o.ay!=null && o.by!=null){
+          if(o.vdir==null) o.vdir=1;
+          o.y += o.speed*o.vdir;
+          if(o.y<=o.by){ o.y=o.by; o.vdir=1; }
+          if(o.y>=o.ay){ o.y=o.ay; o.vdir=-1; }
+        }
+      }
+    }
+
+    // input
+    const left  = keys.has('ArrowLeft') || keys.has('KeyA') || mobile.left;
+    const right = keys.has('ArrowRight')|| keys.has('KeyD') || mobile.right;
+    const jumpK = keys.has('ArrowUp') || keys.has('KeyW') || keys.has('Space') || mobile.jump;
+    if(jumpK) pressJump();
+
+    if(left)  { player.vx -= moveAcc; player.facing=-1; }
+    if(right) { player.vx += moveAcc; player.facing= 1; }
+    player.vx = clamp(player.vx, -maxSpd, maxSpd);
+    if(!left && !right) player.vx *= fric;
+
+    // gravity
+    player.vy += g; if(player.vy>16) player.vy=16;
+
+    // horizontal sweep
+    player.x += player.vx;
+    collideAxis('x');
+
+    // vertical sweep
+    player.y += player.vy;
+    const wasGround = player.onGround;
+    player.onGround = false;
+    collideAxis('y');
+    if(player.onGround) lastGroundMs = nowMs();
+
+    // coyote + jump buffer after collisions
+    if(nowMs()-lastJumpPressMs <= JUMPBUF_MS && nowMs()-lastGroundMs <= COYOTE_MS){
+      player.vy = jumpV; player.onGround=false; lastJumpPressMs = -9999;
+    }
+
+    // death/goal/checkpoint
+    for(const o of world){
+      if(o.type==='spike' && rectHitsSpike(player,o)) { deaths++; HUDd.textContent = deaths; shake(220,7); respawn(); break; }
+      if(o.type==='checkpoint' && AABB(player,o)) checkpoint = {x:o.x, y:o.y};
+      if(o.type==='flag' && AABB(player,o)){
+        if(levelIndex < levels.length-1) { loadLevel(levelIndex+1); }
+        else { finished = true; HUDstate.textContent='✔ Completed'; toggleOverlay('GG! You beat all levels 🎉', 'Press R to replay or P to pause'); }
+      }
+    }
+
+ 
+  
+
+  
+    const targetX = player.x - VW/2 + player.w/2;
+    const targetY = player.y - VH/2 + player.h/2 - 40;
+    cam.x = lerp(cam.x, targetX, 0.08);
+    cam.y = lerp(cam.y, targetY, 0.08);
+  }
+
+  function collideAxis(axis){
+    for(const o of world){
+      if(o.type==='plat' || o.type==='mplat'){
+        if(AABB(player, o)){
+          if(axis==='x'){
+            if(player.vx>0) player.x = o.x - player.w;
+            else if(player.vx<0) player.x = o.x + o.w;
+            player.vx = 0;
+          }else{
+            if(player.vy>0){ player.y = o.y - player.h; player.vy=0; player.onGround=true; }
+            else if(player.vy<0){ player.y = o.y + o.h; player.vy=0; }
+          }
+        }
+      }
+    }
+  }
+
+
+  const particles = [];
+  function part(x,y,vx,vy,life,sz,col){ particles.push({x,y,vx,vy,life,ttl:life,sz,col}); }
+  function updateParticles(dt){
+
+    if(player.onGround && Math.abs(player.vx)>0.3){
+      if(Math.random()<0.5) part(player.x+player.w/2, player.y+player.h, (Math.random()-0.5)*0.4, -Math.random()*0.6, 420, 2, 'rgba(255,255,255,.25)');
+    }
+    for(let i=particles.length-1;i>=0;i--){
+      const p=particles[i]; p.life-=dt*16.67; p.x+=p.vx; p.y+=p.vy; p.vy+=0.02;
+      if(p.life<=0) particles.splice(i,1);
+    }
+  }
+
+  function drawRoundedRect(x,y,w,h,r){
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rr);
+    ctx.arcTo(x+w,y+h,x,y+h,rr);
+    ctx.arcTo(x,y+h,x,y,rr);
+    ctx.arcTo(x,y,x+w,y,rr);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function draw(){
+    const W = cv.width, H = cv.height;
+    const scale = Math.min(W/VW, H/VH);
+    const offX = (W - VW*scale)/2, offY = (H - VH*scale)/2;
+
+    let sx=0, sy=0;
+    const tLeft = shakeT - nowMs();
+    if(tLeft>0){
+      const p = tLeft/shakeT;
+      sx = (Math.random()*2-1)*shakeMag; sy=(Math.random()*2-1)*shakeMag;
+    }
+
+    ctx.save();
+    ctx.clearRect(0,0,W,H);
+
+    const grad = ctx.createLinearGradient(0,0,0,H);
+    grad.addColorStop(0,'#0b1224');
+    grad.addColorStop(1,'#0b0f1a');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0,0,W,H);
+
+    ctx.globalAlpha = 0.35;
+    for(let i=0;i<80;i++){
+      const px = ((i*123.4 + cam.x*0.2) % 1200) * scale;
+      const py = ((i*78.9  + cam.y*0.15)% 800) * scale;
+      ctx.fillStyle = i%9===0 ? '#a6e3ff' : '#7aa6d9';
+      ctx.fillRect((px+W)%W, (py+H)%H, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.translate(offX + sx, offY + sy);
+    ctx.scale(scale, scale);
+    ctx.translate(-cam.x, -cam.y);
+
+    for(const o of world){
+      if(o.type==='plat' || o.type==='mplat'){
+        ctx.save();
+        ctx.shadowColor='rgba(0,0,0,.35)'; ctx.shadowBlur=12; ctx.shadowOffsetY=6;
+        ctx.fillStyle = (o.type==='mplat') ? '#8ee7ff' : '#b9c1cf';
+        drawRoundedRect(o.x, o.y, o.w, o.h, 4);
+        ctx.restore();
+      }else if(o.type==='spike'){
+        ctx.save();
+        ctx.shadowColor='rgba(0,0,0,.4)'; ctx.shadowBlur=10; ctx.shadowOffsetY=4;
+        ctx.fillStyle = '#ff6b6b';
+        ctx.beginPath();
+        ctx.moveTo(o.x, o.y+o.h);
+        ctx.lineTo(o.x+o.w/2, o.y);
+        ctx.lineTo(o.x+o.w, o.y+o.h);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }else if(o.type==='flag'){
+        ctx.fillStyle='#65f38b';
+        ctx.fillRect(o.x-2, o.y, 4, o.h);
+        ctx.fillRect(o.x, o.y, o.w, 14);
+      }else if(o.type==='checkpoint'){
+
+        const pulse = (Math.sin(nowMs()/300)+1)/2;
+        ctx.strokeStyle=`rgba(255,233,102,${0.6+0.3*pulse})`; ctx.lineWidth=2;
+        ctx.strokeRect(o.x-3, o.y-3, o.w+6, o.h+6);
+      }
+    }
+
+    for(const p of particles){
+      ctx.globalAlpha = p.life/p.ttl;
+      ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x,p.y,p.sz,0,Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    const p=player;
+    ctx.save();
+    ctx.translate(p.x + p.w/2, p.y + p.h/2);
+  
+    ctx.globalAlpha=0.25; ctx.fillStyle='#000'; ctx.beginPath(); ctx.ellipse(0, p.h/2+6, 10, 4, 0, 0, Math.PI*2); ctx.fill(); ctx.globalAlpha=1;
+
+    const bob = Math.sin(p.anim*8)*1.2*(p.onGround?1:0.3);
+
+    
+    ctx.fillStyle='#ffffff';
+    drawRoundedRect(-p.w/2, -p.h/2 + bob, p.w, p.h, 3);
+
+  
+    ctx.beginPath(); ctx.arc(0, -p.h/2-7 + bob, 6, 0, Math.PI*2); ctx.fill();
+
+   
+    ctx.strokeStyle='#ffffff'; ctx.lineWidth=2;
+    const swing = Math.sin(p.anim*10)*5;
+    ctx.beginPath(); ctx.moveTo(-3, -p.h/2+8+bob); ctx.lineTo(-10, -p.h/2+18+bob+swing); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(3, -p.h/2+8+bob); ctx.lineTo(10, -p.h/2+18+bob-swing); ctx.stroke();
+
+    ctx.beginPath(); ctx.moveTo(-3, p.h/2-6+bob); ctx.lineTo(-8, p.h/2+6+bob-swing); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(3, p.h/2-6+bob); ctx.lineTo(8, p.h/2+6+bob+swing); ctx.stroke();
+
+    ctx.restore();
+
+    ctx.restore();
+
+
+    const t = (nowMs()-levelStart)/1000;
+    HUDt.textContent = finished ? t.toFixed(2) : t.toFixed(2);
+  }
+
+ 
+  let last = nowMs(), acc = 0, STEP = 1000/60;
+  function loop(){
+    const n = nowMs(); let dt = n - last; last = n;
+    // avoid spiral
+    if(dt>250) dt=250;
+    acc += dt;
+    while(acc >= STEP){ update(1); updateParticles(1); acc -= STEP; }
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  
+  addEventListener('keydown', e=>{
+    if(e.code==='Space' || e.code==='ArrowUp' || e.code==='KeyW') pressJump();
+  });
+  // mobile jump: trigger on tap down, but prevent spam by using lastJumpPressMs window (already handled)
+  btnJ.addEventListener('pointerdown', ()=>pressJump());
+
+  // Restart on finish overlay R
+  overlay.addEventListener('keydown', e=>{
+    if(e.code==='KeyR') { finished=false; toggleOverlay('', ''); deaths=0; HUDd.textContent=deaths; loadLevel(0); }
+  });
+
+  // Initial tip overlay on mobile screens (optional)
+  if(Math.min(innerWidth, innerHeight) < 750){
+    toggleOverlay('Tip', 'Use the on-screen arrows and jump. Press P to pause.');
+    setTimeout(()=>toggleOverlay('', ''), 1800);
+  }
+
+})();
+</script>
+</body>
+</html>
